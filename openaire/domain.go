@@ -2,76 +2,56 @@ package openaire
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes openaire as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/openaire-cli/openaire"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// openaire:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone openaire binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the openaire driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the openaire driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "openaire",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "openaire",
-			Short:  "A command line for openaire.",
-			Long: `A command line for openaire.
+			Short:  "A command line for OpenAIRE open science research.",
+			Long: `A command line for the OpenAIRE public search API.
 
-openaire reads public openaire data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+openaire reads publications, datasets, and software from api.openaire.eu
+over HTTPS, shapes them into clean records, and prints output that pipes
+into the rest of your tools. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/openaire-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `openaire page` and
-	// `ant get openaire://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search publications, datasets, or software",
+		Args:    []kit.Arg{{Name: "keywords", Help: "search terms"}}}, searchPubs)
 
-	// List op: members of a page, the home of `openaire links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// openaire://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "publications", Group: "read", List: true,
+		Summary: "Search publications (shortcut for search --type publications)",
+		Args:    []kit.Arg{{Name: "keywords", Help: "search terms"}}}, searchPublications)
+
+	kit.Handle(app, kit.OpMeta{Name: "datasets", Group: "read", List: true,
+		Summary: "Search datasets (shortcut for search --type datasets)",
+		Args:    []kit.Arg{{Name: "keywords", Help: "search terms"}}}, searchDatasets)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from kit config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +62,87 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Keywords string  `kit:"arg" help:"search terms"`
+	Type     string  `kit:"flag" help:"publications|datasets|software (default: publications)"`
+	Page     int     `kit:"flag,inherit" help:"page number (default 1)"`
+	Size     int     `kit:"flag,inherit" help:"results per page (default 25)"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type keywordsInput struct {
+	Keywords string  `kit:"arg" help:"search terms"`
+	Page     int     `kit:"flag,inherit" help:"page number (default 1)"`
+	Size     int     `kit:"flag,inherit" help:"results per page (default 25)"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func searchPubs(ctx context.Context, in searchInput, emit func(*Publication) error) error {
+	kind := in.Type
+	if kind == "" {
+		kind = "publications"
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	items, err := in.Client.Search(ctx, kind, in.Keywords, in.Page, in.Size)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full openaire.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized openaire reference: %q", input)
+func searchPublications(ctx context.Context, in keywordsInput, emit func(*Publication) error) error {
+	items, err := in.Client.Search(ctx, "publications", in.Keywords, in.Page, in.Size)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("openaire has no resource type %q", uriType)
+func searchDatasets(ctx context.Context, in keywordsInput, emit func(*Publication) error) error {
+	items, err := in.Client.Search(ctx, "datasets", in.Keywords, in.Page, in.Size)
+	if err != nil {
+		return err
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// Classify turns any accepted input into (type, id).
+func (Domain) Classify(input string) (string, string, error) {
+	if input == "" {
+		return "", "", errs.Usage("openaire: empty reference")
 	}
-	return strings.Trim(input, "/")
+	return "publication", input, nil
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+// Locate returns the live https URL for a (type, id).
+func (Domain) Locate(t, id string) (string, error) {
+	switch t {
+	case "publication":
+		return fmt.Sprintf("https://explore.openaire.eu/search/result?id=%s", id), nil
+	default:
+		return "", errs.Usage("openaire has no resource type %q", t)
+	}
 }
