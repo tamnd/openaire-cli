@@ -45,13 +45,13 @@ func makeResult(id, title, author, date, publisher, lang, access, rtype, doi str
 		"metadata": map[string]any{
 			"oaf:entity": map[string]any{
 				"oaf:result": map[string]any{
-					"title":             []any{map[string]any{"$": title}},
-					"creator":           []any{map[string]any{"$": author}},
-					"dateofacceptance":  map[string]any{"$": date},
-					"publisher":         map[string]any{"$": publisher},
-					"language":          map[string]any{"@classname": lang},
-					"bestaccessright":   map[string]any{"@classname": access},
-					"resulttype":        map[string]any{"@classname": rtype},
+					"title":            []any{map[string]any{"$": title}},
+					"creator":          []any{map[string]any{"$": author}},
+					"dateofacceptance": map[string]any{"$": date},
+					"publisher":        map[string]any{"$": publisher},
+					"language":         map[string]any{"@classname": lang},
+					"bestaccessright":  map[string]any{"@classname": access},
+					"resulttype":       map[string]any{"@classname": rtype},
 					"children": map[string]any{
 						"instance": map[string]any{
 							"alternateidentifier": map[string]any{"$": doi},
